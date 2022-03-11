@@ -22,7 +22,7 @@ if not os.path.isdir(RAW_DIR):
 if not os.path.isdir(PROCESSED_DIR):
     os.mkdir(PROCESSED_DIR)
 
-# Get Trading Economics metadata
+# Get Trading Economics metadata.
 codes = pd.read_csv("https://static.quandl.com/coverage/SGE_codes.csv")
 
 # Bulk download Trading Economics Data.
