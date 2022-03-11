@@ -1,6 +1,6 @@
 import dotenv
-import pandas as pd
 import os
+import pandas as pd
 import nasdaqdatalink
 import zipfile
 
@@ -44,7 +44,6 @@ code_dfs = [values.get_group(x) for x in values.groups]
 
 # Process individual series.
 for df in code_dfs:
-
     # Create series subdirectory.
     sge_code = df.iat[0, 0]
     series_dir = os.path.join(PROCESSED_DIR, sge_code.replace("/", ""))
@@ -54,11 +53,11 @@ for df in code_dfs:
     # Create metadata file.
     metadata = codes.loc[codes["code"] == sge_code]
     metadata.to_csv(os.path.join(series_dir, "metadata.csv"), index=False)
-    # Create data fie.
+    
+    # Create data file.
     data = df[["Date", "Values"]]
     data["Date"] = pd.to_datetime(data["Date"], format="%Y-%m-%d")
     data["Date"] = data["Date"].dt.strftime("%m-%d-%Y")
     data.to_csv(os.path.join(series_dir, "data.csv"), index=False)
     data = None  # F(df) [slice off code, format dates]
-    # save data
-    # save metadata
+   
