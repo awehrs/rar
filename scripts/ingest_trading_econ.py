@@ -4,7 +4,7 @@ import pandas as pd
 import nasdaqdatalink
 import zipfile
 
-pd.options.mode.chained_assignment = None  
+pd.options.mode.chained_assignment = None
 
 # Connect to API.
 dotenv.load_dotenv()
@@ -15,7 +15,7 @@ nasdaqdatalink.ApiConfig.api_key = NASDAQ_KEY
 DATABASE_CODE = "SGE"
 RAW_DIR = os.path.join("data", "raw", DATABASE_CODE)
 ZIP_FILE = os.path.join(RAW_DIR, "SGE.zip")
-PROCESSED_DIR = os.path.join("data", "processed", DATABASE_CODE)
+PROCESSED_DIR = os.path.join("data", "processed")
 FIELD_MAPPING = {"name": "Description", "units": "Units", "source": "Source"}
 
 # Create database directories.
@@ -32,12 +32,12 @@ codes = pd.read_csv("https://static.quandl.com/coverage/SGE_codes.csv")
 nasdaqdatalink.Database(DATABASE_CODE).bulk_download_to_file(ZIP_FILE)
 with zipfile.ZipFile(ZIP_FILE, "r") as zip_ref:
     csv_file = os.path.join(RAW_DIR, zip_ref.namelist()[0])
-    zip_ref.extractall(path=RAW_DIR)
+    zip_ref.extractall(RAW_DIR)
     os.remove(ZIP_FILE)
 
 # Process bulk data into intermediate representation:
 
-# Read data into dataframe. 
+# Read data into dataframe.
 values = pd.read_csv(csv_file, names=["Code", "Date", "Values"])
 values[values.columns[0]] = values[values.columns[0]].map(
     lambda x: DATABASE_CODE + "/" + x
@@ -54,7 +54,7 @@ for df in code_dfs:
     series_dir = os.path.join(PROCESSED_DIR, sge_code.replace("/", ""))
     if not os.path.isdir(series_dir):
         os.mkdir(series_dir)
-    
+
     # Create data file.
     data = df[["Date", "Values"]]
     data["Date"] = pd.to_datetime(data["Date"], format="%Y-%m-%d")
@@ -69,5 +69,8 @@ for df in code_dfs:
     metadata.rename(columns=FIELD_MAPPING, inplace=True)
     metadata["Start_Date"] = start_date
     metadata["End_Date"] = end_date
+    metadata["Publisher"] = DATABASE_CODE
     metadata.to_csv(os.path.join(series_dir, "metadata.csv"), index=False)
-   
+
+# Save Trading Economics metadata file.
+codes.to_csv(os.path.join(RAW_DIR, "SGE_metadata.csv"), index=False)
