@@ -1,6 +1,7 @@
 import dotenv
 import os
 import pandas as pd
+import numpy as np
 import nasdaqdatalink
 import zipfile
 
@@ -58,7 +59,8 @@ for df in code_dfs:
     # Create data file.
     data = df[["Date", "Values"]]
     data["Date"] = pd.to_datetime(data["Date"], format="%Y-%m-%d")
-    data["Date"] = data["Date"].dt.strftime("%m-%d-%Y")
+    data["Date"] = data["Date"].dt.strftime("%Y%m%d")
+    pd.to_numeric(data["Date"], errors="coerce").fillna(0).astype(np.int64)
     start_date = data["Date"].tolist()[0]
     end_date = data["Date"].tolist()[-1]
     data.to_csv(os.path.join(series_dir, "data.csv"), index=False)

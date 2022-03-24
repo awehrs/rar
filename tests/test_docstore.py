@@ -11,12 +11,14 @@ import pandas as pd
 
 @pytest.fixture
 def chunk_input():
+
     array_len = 100
     start_date = "20000101"
 
     return {
         "pad_id": -1,
-        "chunk_size": 10,
+        "chunk_size": 11,
+        "array_len": array_len,
         "value_array": np.random.uniform(size=(array_len,)),
         "date_array": np.array(
             [
@@ -52,6 +54,23 @@ def test_chunk_data_array_pad_count(chunk_input):
     date_count = np.count_nonzero(date_chunks[-1] == pad_id)
     value_count = np.count_nonzero(value_chunks[-1] == pad_id)
     assert (date_count == value_count) and (date_count < chunk_size)
+
+
+def test_chunk_data_output_shapes(chunk_input):
+    array_len = chunk_input["array_len"]
+    chunk_size = chunk_input["chunk_size"]
+    date_chunks, value_chunks = chunk_data_array(
+        chunk_input["date_array"],
+        chunk_input["value_array"],
+        chunk_size,
+        chunk_input["pad_id"],
+    )
+    dim_1 = (
+        (array_len // chunk_size) + 1
+        if array_len % chunk_size != 0
+        else array_len / chunk_size
+    )
+    assert date_chunks.shape == value_chunks.shape == (dim_1, chunk_size)
 
 
 def test_chunk_data_array_unequal_len_arrays(chunk_input):
