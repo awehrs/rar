@@ -1,13 +1,16 @@
+from utils import embed, reset_folder_, tokenize
+
 from contextlib import contextmanager
 import functools
 from importlib.metadata import metadata
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from einops import rearrange
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 SOS_ID = 101
 EOS_ID = 102
@@ -38,8 +41,8 @@ class Docstore:
     def __init__(
         self,
         folder: str,
-        document_encoder,
         metadata_memmap_path: str,
+        tokens_memmap_path: str,
         values_memmap_path: str,
         dates_memmap_path: str,
         chunks_idx_memmap_path: str,
@@ -52,81 +55,105 @@ class Docstore:
             "Source",
             "Start_Date",
             "End_Date",
+            "Publisher",
         ],
         chunks_to_embeddings_batch_size: int = 16,
         embed_dim: int = 768,
-        fields_to_embed: dict[str:int] = {"Description": 0, "Units": 1},
+        fields_to_embed: List[str] = ["Description", "Units"],
         index_file: str = "knn.index",
         max_metadata_seq_len: int = 100,
         max_rows_per_embedding_file: int = 500,
+        doc_encoder_model: str = "bert-base-uncased",
         pad_id: int = -1,
         use_cls_repr: bool = False,
         **index_kwargs,
     ) -> None:
 
-        self.chunk_len = chunk_size
-        self.max_chunks = max_chunks
-        self.max_series = max_series
-        self.metadata_fields = metadata_fields
-
         metadata_shape = (max_series, len(metadata_fields))
+        tokens_shape = (max_series, max_metadata_seq_len)
         data_shape = (max_chunks, chunk_size)
         chunks_idx_shape = (max_chunks,)
 
         # Lazily construct data/metadata memmap context managers.
-        self.get_metadata = functools.partial(
+        get_metadata = functools.partial(
             memmap, metadata_memmap_path, dtype=np.object_, shape=metadata_shape
         )
-        self.get_values = functools.partial(
+        get_tokens = functools.partial(
+            memmap, tokens_memmap_path, dtype=np.int32, shape=tokens_shape
+        )
+        get_values = functools.partial(
             memmap, values_memmap_path, dtype=np.float32, shape=data_shape
         )
-        self.get_dates = functools.partial(
+        get_dates = functools.partial(
             memmap, dates_memmap_path, dtype=np.int64, shape=data_shape
         )
-        self.get_chunks_idx = functools.partial(
+        get_chunks_idx = functools.partial(
             memmap, chunks_idx_memmap_path, dtype=np.int64, shape=chunks_idx_shape
         )
 
         # Create data/metadata memory maps.
-        self.stats = memory_map_folder_contents(
+        self.num_chunks, self.num_series = memory_map_folder_contents(
             folder=folder,
-            metadata_memmap_fn=self.get_metadata,
-            dates_memmap_fn=self.get_dates,
-            values_memmap_fn=self.get_dates,
-            chunks_idx_memmap_fn=self.get_chunks_idx,
+            metadata_memmap_fn=get_metadata,
+            tokens_memmap_fn=get_tokens,
+            dates_memmap_fn=get_dates,
+            values_memmap_fn=get_values,
+            chunks_idx_memmap_fn=get_chunks_idx,
+            doc_encoder_model=doc_encoder_model,
+            fields_to_embed=fields_to_embed,
+            max_metadata_seq_len=max_metadata_seq_len,
             chunk_size=chunk_size,
             pad_id=pad_id,
         )
 
         # Lazily construct embeddings memmap context manager.
-        num_chunks = self.stats["chunks"]
-        embeddings_path = f"{metadata_memmap_path}.embedded"
-        embed_shape = (num_chunks, embed_dim)
+        embeddings_path = f"{tokens_memmap_path}.embedded"
+        embed_shape = (self.num_series, embed_dim)
 
-        self.get_embeddings = functools.partial(
+        get_embeddings = functools.partial(
             memmap, embeddings_path, dtype=np.float32, shape=embed_shape
         )
 
-        # Embed metadata and build index.
-        self.index, self.embeddings = embed_and_index_metadata(
-            document_encoder=document_encoder,
-            num_series=self.stats["series"],
-            max_metadata_seq_len=max_metadata_seq_len,
-            embeddings_memmap_fn=self.get_embeddings,
-            metadata_memmap_fn=self.get_metadata,
-            metadata_fields=fields_to_embed,
+        # Embed desired metadata fields.
+        embed_metadata(
+            doc_encoder_model=doc_encoder_model,
+            num_series=self.num_series,
+            embeddings_memmap_fn=get_embeddings,
+            tokens_memmap_fn=get_tokens,
             use_cls_repr=use_cls_repr,
-            max_rows_per_embedding_file=max_rows_per_embedding_file,
-            metadata_to_embeddings_batch_size=chunks_to_embeddings_batch_size,
-            embed_dim=embed_dim,
+            batch_size=chunks_to_embeddings_batch_size,
+        )
+
+        EMBEDDING_TMP_SUBFOLDER = 'embeddings'
+
+        # Memory map the embeddings.
+        chunk_embeddings_to_tmp_files(
+            embeddings_memmap_fn=get_embeddings,
+            shape=embed_shape,
+            dtype=np.float32,
+            folder=EMBEDDING_TMP_SUBFOLDER,
+            max_rows_per_file=max_rows_per_embedding_file,
+        )
+
+        # Create index.
+        index = index_embeddings(
+            embeddings_folder=EMBEDDING_TMP_SUBFOLDER,
             index_file=index_file,
             **index_kwargs,
+        )
+
+        # Memory map the embeddings.
+        embeddings = np.memmap(
+            embedding_path, shape=embed_shape, dtype=np.float32, mode="r"
         )
 
     def search_index(self):
         raise NotImplementedError
 
     def convert_to_torch(self):
+        raise NotImplementedError
+
+    def convert_to_jnp(self):
         raise NotImplementedError
 
 
@@ -137,12 +164,17 @@ def memory_map_folder_contents(
     *,
     folder: str,
     metadata_memmap_fn: functools.partial,
+    tokens_memmap_fn: functools.partial,
     dates_memmap_fn: functools.partial,
     values_memmap_fn: functools.partial,
     chunks_idx_memmap_fn: functools.partial,
+    doc_encoder_model: str,
+    fields_to_embed: List[str],
+    max_metadata_seq_len: int,
     chunk_size: int,
     pad_id: int,
-):
+) -> Tuple[int, int]:
+
     """
     Iterate over series in data folder, and:
         - Memory map its metadata,
@@ -153,16 +185,21 @@ def memory_map_folder_contents(
     Args:
         folder: Directory containing series subdirectories,
             each containing "data.csv" and "metadata.csv" files.
-        metadata_memmap_fn: Partially constructed context manager for metadata memmap.
-        dates_memmap_fn: Partially constructed context manager for dates memmap.
-        values_memmap_fn: Partially constructed context manager for values memmap.
-        chunks_idx_memmap_fn: Partially constructed context manager for
-            memmap that maps series to their chunks' indices
-        chunk_size: Chunk length for data
-        pad_id: Pad value chunked data
+        metadata_memmap_fn: Partially constructed context manager
+            for metadata memmap.
+        dates_memmap_fn: Partially constructed context manager for
+            dates memmap.
+        values_memmap_fn: Partially constructed context manager for
+            values memmap.
+        chunks_idx_memmap_fn: Partially constructed context manager
+            for memmap that maps series to their chunks' indices.
+        doc_encoder_model: Name of huggingface pretrained transformer.
+        fields_to_embed: List of the names of fields to embed.
+        max_metadata_seq_len: Length of token sequence to embed.
+        chunk_size: Chunk length for data.
+        pad_id: Pad value chunked data.
     Returns:
-        Dictionary containing total number of series and chunks
-        in created memmory maps.
+        Total number of chunks, total number of series.
     """
 
     total_chunks = 0
@@ -172,6 +209,7 @@ def memory_map_folder_contents(
 
     with (
         metadata_memmap_fn(mode="w+") as metadata,
+        tokens_memmap_fn(mode="w+") as tokens,
         dates_memmap_fn(mode="w+") as dates,
         values_memmap_fn(mode="w+") as values,
         chunks_idx_memmap_fn(mode="w+") as chunks_idx,
@@ -185,6 +223,19 @@ def memory_map_folder_contents(
 
             # Memory map the metadata fields.
             metadata[total_series] = meta.iloc[0]
+
+            # Memory map tokens of metadata fields to be embeded.
+            text = meta.iloc[0][fields_to_embed].str.cat(sep=" ")
+
+            ids = tokenize(text, doc_encoder_model)
+
+            text_len = ids.shape[-1]
+
+            padding = max_metadata_seq_len - text_len
+
+            ids = F.pad(ids, (0, padding))
+
+            tokens[total_series] = ids
 
             # Break data array into equal length chunks.
             date_chunks, value_chunks = chunk_data_arrays(
@@ -202,10 +253,7 @@ def memory_map_folder_contents(
             total_chunks += data_chunk_len
             total_series += 1
 
-    return dict(
-        chunks=total_chunks,
-        series=total_series,
-    )
+    return total_chunks, total_series
 
 
 def chunk_data_arrays(
@@ -213,7 +261,8 @@ def chunk_data_arrays(
     value_array: np.ndarray,
     chunk_size: int,
     pad_id: int,
-):
+) -> Tuple(np.ndarray, np.ndarray):
+
     """
     Break arrays into equal size chunks.
 
@@ -252,103 +301,100 @@ def chunk_data_arrays(
     return date_chunks, value_chunks
 
 
-def embed_and_index_metadata(
-    *,
-    document_encoder,
-    num_series: int,
-    max_metadata_seq_len: int,
-    embeddings_memmap_fn: functools.partial,
-    metadata_memmap_fn: functools.partial,
-    metadata_fields: List[str],
-    use_cls_repr: bool,
-    max_rows_per_embedding_file: int,
-    metadata_to_embeddings_batch_size: int,
-    embed_dim: int,
-    index_file: str,
-    **index_kwargs,
-):
-
-    # Embed desired metadata fields.
-    embed_metadata(
-        document_encoder=document_encoder,
-        num_series=num_series,
-        max_metadata_seq_len=max_metadata_seq_len,
-        embeddings_memmap_fn=embeddings_memmap_fn,
-        meta_memmap_fn=metadata_memmap_fn,
-        metadata_fields=metadata_fields,
-        use_cls_repr=use_cls_repr,
-        batch_size=metadata_to_embeddings_batch_size,
-        embed_dim=embed_dim,
-        pad_id=None,  # diff pad id?
-    )
-
-    # Memory map the embeddings.
-    memmap_file_to_chunks_(
-        embedding_path,
-        shape=embed_shape,
-        dtype=np.float32,
-        folder=EMBEDDING_TMP_SUBFOLDER,
-        max_rows_per_file=max_rows_per_file,
-    )
-
-    # Create index.
-    index = index_embeddings(
-        embeddings_folder=EMBEDDING_TMP_SUBFOLDER, index_file=index_file, **index_kwargs
-    )
-
-    # Memory map the embeddings.
-    embeddings = np.memmap(
-        embedding_path, shape=embed_shape, dtype=np.float32, mode="r"
-    )
-
-    return index, embeddings
-
-
 def embed_metadata(
     *,
-    document_encoder,
+    doc_encoder_model: str,
     num_series: int,
-    max_metadata_seq_len: int,
     embeddings_memmap_fn: functools.partial,
-    metadata_memmap_fn: functools.partial,
-    metadata_fields: dict[str:int],
+    tokens_memmap_fn: functools.partial,
     use_cls_repr: bool,
     batch_size: int,
-    embed_dim: int,
-    pad_id=None,  # diff pad id?
-):
+) -> None:
+    """
+    Break memory mapped token sequences into chunks.
+    Batch encode the chunks.
+
+    Args:
+        doc_encoder_model: The name of the HuggingFace transformer
+            model to use for document encoder.
+        num_series: The number of token sequences to embed.
+        embeddings_memmap_fn: Partially constructed context manager for
+            embeddings memmap.
+        tokens_memmap_fn: Partially constructed context manager for
+            tokens memmap.
+        use_cls_repr: Whether the document encoder should return mean of
+            entire hidden state tensor, or just [CLS] vector.
+        batch_size: Batch size for encoding token sequences.
+    Returns:
+        None.
+    """
 
     with (
         embeddings_memmap_fn(mode="w+") as embeddings,
-        metadata_memmap_fn() as metadata,
+        tokens_memmap_fn() as tokens,
     ):
 
         for dim_slice in range_chunked(num_series, batch_size=batch_size):
-            # Get all metadata fields.
-            batch_chunk_npy = metadata[dim_slice]
 
-            # Filter for desired metadata fields.
-            batch_chunk_npy = batch_chunk_npy[:, [metadata_fields.values()]]
+            batch_chunk_npy = tokens[dim_slice]
 
             batch_chunk = torch.from_numpy(batch_chunk_npy)
 
             cls_tokens = torch.full((batch_chunk.shape[0], 1), SOS_ID)
+
             batch_chunk = torch.cat((cls_tokens, batch_chunk), dim=1)
 
-            batch_chunk = batch_chunk[
-                :, :-1
-            ]  # omit last token, the first token of the next chunk, used for autoregressive training
-
-            batch_embed = bert_embed(batch_chunk, return_cls_repr=use_cls_repr)
+            batch_embed = embed(batch_chunk, doc_encoder_model, use_cls_repr)
 
             embeddings[dim_slice] = batch_embed.detach().cpu().numpy()
-            print(f"embedded {dim_slice.stop} / {num_chunks}")
 
 
-# Map series index to chunks
+def chunk_embeddings_to_tmp_files(
+    embeddings_memmap_fn: functools.partial,
+    *,
+    folder: str,
+    shape: Tuple[int, int],
+    dtype,
+    max_rows_per_file: int,
+) -> None:
 
-# Concatenate and embed selected fields
+    rows, _ = shape
 
-# Break up embeddings into temp files, for autofaiss indexing
+    with embeddings_memmap_fn(mode='r') as embeddings:
+        root_path = TMP_PATH / folder
+        reset_folder_(root_path)
 
-# Build date array
+        for ind, dim_slice in enumerate(range_chunked(rows, batch_size=max_rows_per_file)):
+            filename = root_path / f'{ind}.npy'
+            data_slice = f[dim_slice]
+
+            np.save(str(filename), f[dim_slice])
+
+
+
+def index_embeddings(
+    embeddings_folder,
+    *,
+    index_file = 'knn.index',
+    index_infos_file = 'index_infos.json',
+    max_index_memory_usage = '100m',
+    current_memory_available = '1G'
+):
+    embeddings_path = TMP_PATH / embeddings_folder
+    index_path = INDEX_FOLDER_PATH / index_file
+
+    reset_folder_(INDEX_FOLDER_PATH)
+    
+
+def build_index(
+        embeddings = str(embeddings_path),
+        index_path = str(index_path),
+        index_infos_path = str(INDEX_FOLDER_PATH / index_infos_file),
+        max_index_memory_usage = max_index_memory_usage,
+        current_memory_available = current_memory_available,
+        should_be_memory_mappable = True,
+        use_gpu = torch.cuda.is_available(),
+    )
+
+    index = faiss_read_index(index_path)
+    return index
