@@ -1,3 +1,5 @@
+"""Script to bulk download and process Trading Economics data."""
+
 import dotenv
 import os
 import pandas as pd

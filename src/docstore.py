@@ -2,18 +2,28 @@ from utils import embed, reset_folder_, tokenize
 
 from contextlib import contextmanager
 import functools
-from importlib.metadata import metadata
 import os
+from pathlib import Path
 from typing import Dict, List, Tuple
 
+from autofaiss import build_index
 from einops import rearrange
+import faiss
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 
+
+# Constants
+
 SOS_ID = 101
 EOS_ID = 102
+
+TMP_PATH = Path("./.tmp")
+INDEX_FOLDER_PATH = TMP_PATH / ".index"
+EMBEDDING_TMP_SUBFOLDER = "embeddings"
+
 
 # Helper functions.
 
@@ -32,6 +42,10 @@ def range_chunked(max_value, *, batch_size):
         curr = min(curr, max_value)
         yield slice(counter, curr)
         counter = curr
+
+
+def faiss_read_index(path):
+    return faiss.read_index(str(path), faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
 
 
 # Class defintion(s).
@@ -124,9 +138,7 @@ class Docstore:
             batch_size=chunks_to_embeddings_batch_size,
         )
 
-        EMBEDDING_TMP_SUBFOLDER = 'embeddings'
-
-        # Memory map the embeddings.
+        # Save embeddings to temporary files.
         chunk_embeddings_to_tmp_files(
             embeddings_memmap_fn=get_embeddings,
             shape=embed_shape,
@@ -136,18 +148,21 @@ class Docstore:
         )
 
         # Create index.
-        index = index_embeddings(
+        self.index = index_embeddings(
             embeddings_folder=EMBEDDING_TMP_SUBFOLDER,
             index_file=index_file,
             **index_kwargs,
         )
 
-        # Memory map the embeddings.
-        embeddings = np.memmap(
-            embedding_path, shape=embed_shape, dtype=np.float32, mode="r"
+        # Get memory map of embeddings directly.
+        self.embeddings = np.memmap(
+            embeddings_path, shape=embed_shape, dtype=np.float32, mode="r"
         )
 
     def search_index(self):
+        raise NotImplementedError
+
+    def save_index(self):
         raise NotImplementedError
 
     def convert_to_torch(self):
@@ -224,7 +239,7 @@ def memory_map_folder_contents(
             # Memory map the metadata fields.
             metadata[total_series] = meta.iloc[0]
 
-            # Memory map tokens of metadata fields to be embeded.
+            # Memory map tokens of metadata fields to be embedded.
             text = meta.iloc[0][fields_to_embed].str.cat(sep=" ")
 
             ids = tokenize(text, doc_encoder_model)
@@ -354,46 +369,43 @@ def chunk_embeddings_to_tmp_files(
     *,
     folder: str,
     shape: Tuple[int, int],
-    dtype,
     max_rows_per_file: int,
 ) -> None:
 
     rows, _ = shape
 
-    with embeddings_memmap_fn(mode='r') as embeddings:
+    with embeddings_memmap_fn(mode="r") as f:
         root_path = TMP_PATH / folder
         reset_folder_(root_path)
 
-        for ind, dim_slice in enumerate(range_chunked(rows, batch_size=max_rows_per_file)):
-            filename = root_path / f'{ind}.npy'
-            data_slice = f[dim_slice]
-
+        for ind, dim_slice in enumerate(
+            range_chunked(rows, batch_size=max_rows_per_file)
+        ):
+            filename = root_path / f"{ind}.npy"
             np.save(str(filename), f[dim_slice])
-
 
 
 def index_embeddings(
     embeddings_folder,
     *,
-    index_file = 'knn.index',
-    index_infos_file = 'index_infos.json',
-    max_index_memory_usage = '100m',
-    current_memory_available = '1G'
+    index_file="knn.index",
+    index_infos_file="index_infos.json",
+    max_index_memory_usage="100m",
+    current_memory_available="1G",
 ):
     embeddings_path = TMP_PATH / embeddings_folder
     index_path = INDEX_FOLDER_PATH / index_file
 
     reset_folder_(INDEX_FOLDER_PATH)
-    
 
-def build_index(
-        embeddings = str(embeddings_path),
-        index_path = str(index_path),
-        index_infos_path = str(INDEX_FOLDER_PATH / index_infos_file),
-        max_index_memory_usage = max_index_memory_usage,
-        current_memory_available = current_memory_available,
-        should_be_memory_mappable = True,
-        use_gpu = torch.cuda.is_available(),
+    build_index(
+        embeddings=str(embeddings_path),
+        index_path=str(index_path),
+        index_infos_path=str(INDEX_FOLDER_PATH / index_infos_file),
+        max_index_memory_usage=max_index_memory_usage,
+        current_memory_available=current_memory_available,
+        should_be_memory_mappable=True,
+        use_gpu=torch.cuda.is_available(),
     )
 
     index = faiss_read_index(index_path)
