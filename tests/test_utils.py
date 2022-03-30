@@ -1,6 +1,5 @@
 from src.utils import embed, tokenize
 
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -9,7 +8,10 @@ SEQ_LEN = 200
 
 
 def test_embed():
-    """Test that tokenizing/embedding pipeline produces sensible results."""
+    """
+    Test that tokenizing/embedding produce different
+    outputs for CLS versus non-CLS representations.
+    """
 
     sentence1 = "This is the first sentence."
     sentence2 = "This is the second sentence with a few extra words."

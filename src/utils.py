@@ -1,4 +1,5 @@
 import os
+from shutil import rmtree
 from typing import Callable, List, Tuple, Union
 
 from einops import rearrange
@@ -91,3 +92,9 @@ def embed(
 
 def is_true_env_flag(env_flag):
     return os.getenv(env_flag, "false").lower() in ("true", "1", "t")
+
+
+def reset_folder_(p):
+    path = Path(p)
+    rmtree(path, ignore_errors=True)
+    path.mkdir(exist_ok=True, parents=True)

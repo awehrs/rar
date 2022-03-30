@@ -1,4 +1,4 @@
-from utils import embed, reset_folder_, tokenize
+from src.utils import embed, reset_folder_, tokenize
 
 from contextlib import contextmanager
 import functools
@@ -63,7 +63,7 @@ class Docstore:
         max_series: int,
         chunk_size: int,
         max_chunks: int,
-        metadata_fields: List[str:int] = [
+        metadata_fields: List[str] = [
             "Description",
             "Units",
             "Source",
@@ -82,6 +82,11 @@ class Docstore:
         use_cls_repr: bool = False,
         **index_kwargs,
     ) -> None:
+
+        """
+        Memory map metadata, chunks of dates and values, and
+        tokens and embeddings of selected metadata fields.
+        """
 
         metadata_shape = (max_series, len(metadata_fields))
         tokens_shape = (max_series, max_metadata_seq_len)
@@ -191,6 +196,7 @@ def memory_map_folder_contents(
 ) -> Tuple[int, int]:
 
     """
+
     Iterate over series in data folder, and:
         - Memory map its metadata,
         - Memory map its chunked data,
@@ -233,7 +239,7 @@ def memory_map_folder_contents(
         for path in paths:
             meta = pd.read_csv(os.path.join(path, "metadata.csv"))
             data = pd.read_csv(os.path.join(path, "data.csv"))
-            date_array = data["Dates"]
+            date_array = data["Date"]
             value_array = data["Values"]
 
             # Memory map the metadata fields.
@@ -258,7 +264,7 @@ def memory_map_folder_contents(
             )
 
             data_chunk_len = date_chunks.shape[0]
-            chunk_slice = slice[total_chunks : (total_chunks + data_chunk_len)]
+            chunk_slice = slice(total_chunks, (total_chunks + data_chunk_len))
 
             # Memory map the data chunks and their indices.
             dates[chunk_slice] = date_chunks
@@ -276,7 +282,7 @@ def chunk_data_arrays(
     value_array: np.ndarray,
     chunk_size: int,
     pad_id: int,
-) -> Tuple(np.ndarray, np.ndarray):
+) -> Tuple[np.ndarray, np.ndarray]:
 
     """
     Break arrays into equal size chunks.
@@ -325,6 +331,7 @@ def embed_metadata(
     use_cls_repr: bool,
     batch_size: int,
 ) -> None:
+
     """
     Break memory mapped token sequences into chunks.
     Batch encode the chunks.
@@ -372,6 +379,19 @@ def chunk_embeddings_to_tmp_files(
     max_rows_per_file: int,
 ) -> None:
 
+    """
+    Use memory map of embeddings to create temporary
+    .npy files, to use for creating faiss index.
+
+    Args:
+        embeddings_memmap_fn: Partially constructed context manager for
+            embeddings memmap.
+        folder: Path to folder where .npy files will be placed.
+        shape: The shape of the embedding memmap.
+        max_rows_per_file: Number of rows from memmap to put .npy file.
+    Returns:
+        None.
+    """
     rows, _ = shape
 
     with embeddings_memmap_fn(mode="r") as f:
@@ -386,13 +406,27 @@ def chunk_embeddings_to_tmp_files(
 
 
 def index_embeddings(
-    embeddings_folder,
+    embeddings_folder: str,
     *,
-    index_file="knn.index",
-    index_infos_file="index_infos.json",
-    max_index_memory_usage="100m",
-    current_memory_available="1G",
-):
+    index_file: str = "knn.index",
+    index_infos_file: str = "index_infos.json",
+    max_index_memory_usage: str = "100m",
+    current_memory_available: str = "1G",
+) -> faiss.Index:
+
+    """
+    Build index from temporary .npy files of embeddings.
+
+    Args:
+        embeddings_folder: Temporary folder with .npy files.
+        index_file: Path where index will be saved.
+        index_infos_file: Path to index info file.
+        max_index_memory_usage: Maximum amount of memory index can use.
+        current_memory_available: Current memory available.
+    Returns:
+        Faiss index
+    """
+
     embeddings_path = TMP_PATH / embeddings_folder
     index_path = INDEX_FOLDER_PATH / index_file
 
@@ -409,4 +443,5 @@ def index_embeddings(
     )
 
     index = faiss_read_index(index_path)
+
     return index
