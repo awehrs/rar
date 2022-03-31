@@ -2,9 +2,11 @@ from src.utils import embed, reset_folder_, tokenize
 
 from contextlib import contextmanager
 import functools
+import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from tqdm import tqdm
+from typing import List, Tuple
 
 from autofaiss import build_index
 from einops import rearrange
@@ -15,13 +17,19 @@ import torch
 import torch.nn.functional as F
 
 
-# Constants
+# Logging.
+
+logger = logging.getLogger(name=__name__)
+logger.setLevel(logging.INFO)
+
+
+# Constants.
 
 SOS_ID = 101
 EOS_ID = 102
 
 TMP_PATH = Path("./.tmp")
-INDEX_FOLDER_PATH = TMP_PATH / ".index"
+INDEX_FOLDER_PATH = Path("./data/.index")
 EMBEDDING_TMP_SUBFOLDER = "embeddings"
 
 
@@ -55,14 +63,14 @@ class Docstore:
     def __init__(
         self,
         folder: str,
-        metadata_memmap_path: str,
-        tokens_memmap_path: str,
-        values_memmap_path: str,
-        dates_memmap_path: str,
-        chunks_idx_memmap_path: str,
-        max_series: int,
-        chunk_size: int,
-        max_chunks: int,
+        metadata_memmap_path: str = "metadata.dat",
+        tokens_memmap_path: str = "tokens.dat",
+        values_memmap_path: str = "values.dat",
+        dates_memmap_path: str = "dates.dat",
+        chunks_idx_memmap_path: str = "chunks_idx.dat",
+        max_series: int = 10_000,
+        chunk_size: int = 100,
+        max_chunks: int = 10_000,
         metadata_fields: List[str] = [
             "Description",
             "Units",
@@ -74,7 +82,8 @@ class Docstore:
         chunks_to_embeddings_batch_size: int = 16,
         embed_dim: int = 768,
         fields_to_embed: List[str] = ["Description", "Units"],
-        index_file: str = "knn.index",
+        save_index_to_disk: bool = False,
+        index_folder: str = "data/index",
         max_metadata_seq_len: int = 100,
         max_rows_per_embedding_file: int = 500,
         doc_encoder_model: str = "bert-base-uncased",
@@ -111,6 +120,8 @@ class Docstore:
         )
 
         # Create data/metadata memory maps.
+        logger.info("Memory mapping folder contents...")
+
         self.num_chunks, self.num_series = memory_map_folder_contents(
             folder=folder,
             metadata_memmap_fn=get_metadata,
@@ -134,6 +145,8 @@ class Docstore:
         )
 
         # Embed desired metadata fields.
+        logger.info("Embedding metadata fields...")
+
         embed_metadata(
             doc_encoder_model=doc_encoder_model,
             num_series=self.num_series,
@@ -144,18 +157,22 @@ class Docstore:
         )
 
         # Save embeddings to temporary files.
+        logger.info("Preparing embeddings for indexing.")
+
         chunk_embeddings_to_tmp_files(
             embeddings_memmap_fn=get_embeddings,
-            shape=embed_shape,
-            dtype=np.float32,
             folder=EMBEDDING_TMP_SUBFOLDER,
+            shape=embed_shape,
             max_rows_per_file=max_rows_per_embedding_file,
         )
 
         # Create index.
+        logger.info("Building index...")
+
         self.index = index_embeddings(
             embeddings_folder=EMBEDDING_TMP_SUBFOLDER,
-            index_file=index_file,
+            index_folder=index_folder,
+            save_index_to_disk=save_index_to_disk,
             **index_kwargs,
         )
 
@@ -236,7 +253,7 @@ def memory_map_folder_contents(
         chunks_idx_memmap_fn(mode="w+") as chunks_idx,
     ):
 
-        for path in paths:
+        for path in tqdm(paths):
             meta = pd.read_csv(os.path.join(path, "metadata.csv"))
             data = pd.read_csv(os.path.join(path, "data.csv"))
             date_array = data["Date"]
@@ -366,7 +383,11 @@ def embed_metadata(
 
             batch_chunk = torch.cat((cls_tokens, batch_chunk), dim=1)
 
-            batch_embed = embed(batch_chunk, doc_encoder_model, use_cls_repr)
+            batch_embed = embed(
+                model=doc_encoder_model,
+                token_ids=batch_chunk,
+                return_cls_repr=use_cls_repr,
+            )
 
             embeddings[dim_slice] = batch_embed.detach().cpu().numpy()
 
@@ -407,11 +428,12 @@ def chunk_embeddings_to_tmp_files(
 
 def index_embeddings(
     embeddings_folder: str,
-    *,
-    index_file: str = "knn.index",
-    index_infos_file: str = "index_infos.json",
-    max_index_memory_usage: str = "100m",
-    current_memory_available: str = "1G",
+    save_index_to_disk: bool,
+    index_file="knn.index",
+    index_infos_file="index_infos.json",
+    max_index_memory_usage="100m",
+    current_memory_available="1G",
+    **index_kwargs,
 ) -> faiss.Index:
 
     """
@@ -419,29 +441,31 @@ def index_embeddings(
 
     Args:
         embeddings_folder: Temporary folder with .npy files.
-        index_file: Path where index will be saved.
-        index_infos_file: Path to index info file.
+        save_index_to_disk: Whether to persist index after knn calculations.
+        index_file: File to save index to.
+        index_infos_file: File to save index info to.
         max_index_memory_usage: Maximum amount of memory index can use.
         current_memory_available: Current memory available.
     Returns:
-        Faiss index
+        Faiss index.
     """
 
     embeddings_path = TMP_PATH / embeddings_folder
+
     index_path = INDEX_FOLDER_PATH / index_file
 
-    reset_folder_(INDEX_FOLDER_PATH)
+    if save_index_to_disk == True:
+        reset_folder_(INDEX_FOLDER_PATH)
 
-    build_index(
+    index = build_index(
         embeddings=str(embeddings_path),
         index_path=str(index_path),
         index_infos_path=str(INDEX_FOLDER_PATH / index_infos_file),
+        save_on_disk=save_index_to_disk,
         max_index_memory_usage=max_index_memory_usage,
         current_memory_available=current_memory_available,
         should_be_memory_mappable=True,
         use_gpu=torch.cuda.is_available(),
     )
-
-    index = faiss_read_index(index_path)
 
     return index

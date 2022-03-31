@@ -1,14 +1,13 @@
+from curses import meta
 from src.docstore import (
     Docstore,
     chunk_data_arrays,
-    memmap,
-    memory_map_folder_contents,
 )
 
-import functools
 import os
 import numpy as np
 import pandas as pd
+from pathlib import Path
 import pytest
 from tempfile import mkdtemp
 
@@ -107,4 +106,35 @@ def test_chunk_data_arrays_unequal_len_arrays(chunk_input):
 
 @pytest.fixture
 def docstore_inputs():
-    pass
+    root_dir = Path(".") / TemporaryDirectory
+    return Docstore(
+        folder=os.path.join("data", "mock"),
+        metadata_memmap_path=root_dir / "metadata.dat",
+        tokens_memmap_path=root_dir / "tokens.dat",
+        values_memmap_path=root_dir / "values.dat",
+        dates_memmap_path=root_dir / "dates.dat",
+        chunks_idx_memmap_path=root_dir / "chunks_idx.dat",
+        max_series=200,
+        chunk_size=100,
+        max_chunks=10000,
+    )
+
+
+def test_docstore_init(docstore_inputs):
+    assert True
+
+
+root_dir = Path(mkdtemp())
+
+Docstore(
+    folder=os.path.join("data", "mock"),
+    metadata_memmap_path=root_dir / "metadata.dat",
+    tokens_memmap_path=root_dir / "tokens.dat",
+    values_memmap_path=root_dir / "values.dat",
+    dates_memmap_path=root_dir / "dates.dat",
+    chunks_idx_memmap_path=root_dir / "chunks_idx.dat",
+    save_index_to_disk=False,
+    max_series=200,
+    chunk_size=100,
+    max_chunks=10000,
+)

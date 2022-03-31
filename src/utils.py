@@ -1,5 +1,6 @@
 import os
 from shutil import rmtree
+from pathlib import Path
 from typing import Callable, List, Tuple, Union
 
 from einops import rearrange
