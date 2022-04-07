@@ -35,9 +35,11 @@ def get_model(model: str) -> Callable:
 
 def tokenize(
     texts: Union[List, Tuple],
+    *,
     model: str,
+    max_length: int,
     add_special_tokens: bool = True,
-):
+) -> torch.tensor:
 
     if not isinstance(texts, (list, tuple)):
         texts = [texts]
@@ -45,7 +47,12 @@ def tokenize(
     tokenizer = get_tokenizer(model)
 
     encoding = tokenizer.batch_encode_plus(
-        texts, add_special_tokens=add_special_tokens, padding=True, return_tensors="pt"
+        texts,
+        add_special_tokens=add_special_tokens,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
     )
 
     token_ids = encoding.input_ids
