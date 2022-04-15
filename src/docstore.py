@@ -2,14 +2,16 @@ from src.utils import embed, reset_folder_, tokenize
 
 from contextlib import contextmanager
 import functools
+from inspect import signature
+import json
 import logging
 import os
 from pathlib import Path
-from shutil import rmtree
-from typing import List, Optional, Sequence, Tuple
+import shutil
+import tempfile
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 from autofaiss import build_index
-from einops import rearrange
 import faiss
 import numpy as np
 import pandas as pd
@@ -27,11 +29,6 @@ logger.setLevel(logging.INFO)
 
 SOS_ID = 101
 EOS_ID = 102
-
-TMP_PATH = Path("./.tmp")
-INDEX_FOLDER_PATH = Path("./data/.index")
-EMBEDDING_TMP_SUBFOLDER = "embeddings"
-
 
 # Helper functions.
 
@@ -56,20 +53,103 @@ def faiss_read_index(path):
     return faiss.read_index(str(path), faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
 
 
-# Class defintion(s).
+# Class defintion.
 
 
 class Docstore:
     def __init__(
         self,
-        data_folder: str,
-        docstore_folder: Optional[str] = None,
-        metadata_memmap_path: str = "metadata.dat",
-        tokens_memmap_path: str = "tokens.dat",
-        data_memmap_path: str = "data.dat",
-        chunks_idx_memmap_path: str = "chunks_idx.dat",
+        *,
+        faiss_index: faiss.swigfaiss.Index,
+        data_memmap: functools.partial,
+        tokens_memmap: functools.partial,
+        chunks_idx_memmap: functools.partial,
+        config_dict: dict,
+    ) -> None:
+
+        self._faiss_index = faiss_index
+        self._data_memmap = data_memmap
+        self._chunks_idx_memmap = chunks_idx_memmap
+        self._tokens_memmap = tokens_memmap
+        self._config_dict = config_dict
+
+    # Factory functions.
+
+    @classmethod
+    def load(
+        cls,
+        docstore_dir: Union[str, Path],
+    ) -> object:
+        """
+        Load index, memory maps, and config from disk.
+
+        Args:
+            docstore_dir: Directory holding memory maps, index, and
+                configuation dictionary.
+        Returns:
+            Docstore instance.
+        """
+
+        # Check that relevant files exist.
+        root_dir = Path(docstore_dir)
+
+        _paths = dict(
+            index_path=cls.index_path(root_dir),
+            config_path=cls.config_path(root_dir),
+            data_path=cls.memmap_path(root_dir, "data"),
+            tokens_path=cls.memmap_path(root_dir, "tokens"),
+            chunks_idx_path=cls.memmap_path(root_dir, "chunks_idx"),
+        )
+
+        for _path in _paths.values():
+            if not os.path.isfile(_path):
+                raise ValueError(
+                    f"The file {_path} files does not exist in indicated directory."
+                )
+
+        # Load object configuration.
+        _config_dict: dict = {}
+
+        with open(_paths["config_path"], "r") as config_file:
+            _config_dict = json.load(config_file)
+
+        init_params = dict(config_dict=_config_dict)
+
+        # Fetch index and memory maps.
+        init_params["faiss_index"] = faiss.read_index(_paths["index_path"])
+
+        init_params["data_memmap"] = functools.partial(
+            memmap,
+            _paths["data_path"],
+            dtype=cls.memmap_dtype("data"),
+            shape=(_config_dict["max_data_len"], 2),
+        )
+        init_params["tokens_memmap"] = functools.partial(
+            memmap,
+            _paths["tokens_path"],
+            dtype=cls.memmap_dtype("tokens"),
+            shape=(_config_dict["max_series"], _config_dict["max_metadata_seq_len"]),
+        )
+        init_params["chunks_idx_memmap"] = functools.partial(
+            memmap,
+            _paths["chunks_idx_path"],
+            dtype=cls.memmap_dtype("chunks_idx"),
+            shape=(_config_dict["max_data_len"],),
+        )
+
+        return cls(**init_params)
+
+    @classmethod
+    def build(
+        cls,
+        data_dir: Union[str, Path],
+        embed_dim: int = 768,
+        doc_encoder_model: str = "bert-base-uncased",
+        use_cls_repr: bool = False,
         max_series: int = 10_000,
         max_data_len: int = 10_000_000,
+        max_metadata_seq_len: int = 100,
+        max_rows_per_embedding_file: int = 500,
         metadata_fields: List[str] = [
             "Description",
             "Units",
@@ -78,58 +158,65 @@ class Docstore:
             "End_Date",
             "Publisher",
         ],
+        fields_to_embed: List[str] = ["Description", "Units"],
         metadata_to_tokens_batch_size: int = 16,
         chunks_to_embeddings_batch_size: int = 16,
-        embed_dim: int = 768,
-        fields_to_embed: List[str] = ["Description", "Units"],
-        save_index_to_disk: bool = False,
-        index_folder: str = "data/index",
-        max_metadata_seq_len: int = 100,
-        max_rows_per_embedding_file: int = 500,
-        doc_encoder_model: str = "bert-base-uncased",
-        use_cls_repr: bool = False,
         **index_kwargs,
-    ) -> None:
-
+    ) -> object:
         """
-        Memory map metadata, chunks of dates and values, and
-        tokens and embeddings of selected metadata fields.
+        Build Docstore from local files.
+
+        Args:
+            data_dir: Local directory with data.
+            embed_dim: Embedding dimension of document encoder/index.
+            doc_encoder_model: Model name of document encoder.
+            use_cls_repr: Whether to represent metadata embedding by
+                [CLS] token. If false, mean of final latent values is
+                used.
+            max_series: Maximum number of series the Docstore can hold.
+            max_data_len: Maximum length allowed for a time series.
+            max_metadata_seq_len: Maximum number of tokens in metadata
+                sequence to be embedded.
+            max_rows_per_embedding_file: Maximum number of embeddings per
+                temporary .npy file.
+            metadata_fields: Column names of metadata files.
+            fields_to_embed: The metadata fields to concatenate, embed,
+                and index.
+            metadata_to_tokens_batch_size: Batch size for tokenizing metadata
+                fields.
+            chunks_to_embeddings_batch_size: Batch size for embedding
+                metadata fields.
+        Returns:
+            Docstore instance.
         """
+        logger.info("Loading exisiting docstore from disk...")
 
-        metadata_shape = (max_series, len(metadata_fields))
-        tokens_shape = (max_series, max_metadata_seq_len)
-        data_shape = (max_data_len, 2)
-        chunks_idx_shape = (max_data_len,)
-
-        # Lazily construct data/metadata memmap context managers.
-        if docstore_folder == None:
-            docstore_folder = TMP_PATH
-        else:
-            docstore_folder = Path(docstore_folder)
+        # Lazily construct data/metadata context managers.
+        _memmap_dir = Path(tempfile.mkdtemp())
 
         get_metadata = functools.partial(
             memmap,
-            docstore_folder / metadata_memmap_path,
-            dtype=np.object_,
-            shape=metadata_shape,
+            cls.memmap_path(_memmap_dir, "metadata"),
+            dtype=cls.memmap_dtype("metadata"),
+            shape=(max_series, len(fields_to_embed)),
         )
         get_tokens = functools.partial(
             memmap,
-            docstore_folder / tokens_memmap_path,
-            dtype=np.int32,
-            shape=tokens_shape,
+            cls.memmap_path(_memmap_dir, "tokens"),
+            dtype=cls.memmap_dtype("tokens"),
+            shape=(max_series, max_metadata_seq_len),
         )
         get_data = functools.partial(
             memmap,
-            docstore_folder / data_memmap_path,
-            dtype=np.float32,
-            shape=data_shape,
+            cls.memmap_path(_memmap_dir, "data"),
+            dtype=cls.memmap_dtype("data"),
+            shape=(max_data_len, 2),
         )
         get_chunks_idx = functools.partial(
             memmap,
-            docstore_folder / chunks_idx_memmap_path,
-            dtype=np.int64,
-            shape=chunks_idx_shape,
+            cls.memmap_path(_memmap_dir, "chunks_idx"),
+            dtype=cls.memmap_dtype("chunks_idx"),
+            shape=(max_data_len,),
         )
 
         # Create data/metadata memory maps.
@@ -138,7 +225,7 @@ class Docstore:
         columns_to_embed = [metadata_fields.index(_) for _ in fields_to_embed]
 
         num_series = memory_map_folder_contents(
-            folder=data_folder,
+            folder=data_dir,
             metadata_memmap_fn=get_metadata,
             data_memmap_fn=get_data,
             tokens_memmap_fn=get_tokens,
@@ -150,11 +237,11 @@ class Docstore:
         )
 
         # Lazily construct embeddings memmap context manager.
-        embeddings_path = f"{tokens_memmap_path}.embedded"
-        embed_shape = (num_series, embed_dim)
-
         get_embeddings = functools.partial(
-            memmap, embeddings_path, dtype=np.float32, shape=embed_shape
+            memmap,
+            cls.memmap_path(_memmap_dir, "embeddings"),
+            dtype=cls.memmap_dtype("embeddings"),
+            shape=(num_series, embed_dim),
         )
 
         # Embed desired metadata fields.
@@ -170,51 +257,168 @@ class Docstore:
         )
 
         # Save embeddings to temporary files.
-        logger.info("Preparing embeddings for indexing.")
+        logger.info("Preparing embeddings for indexing...")
+
+        embeddings_tmp_folder = Path(tempfile.mkdtemp())
 
         chunk_embeddings_to_tmp_files(
             embeddings_memmap_fn=get_embeddings,
-            folder=EMBEDDING_TMP_SUBFOLDER,
-            shape=embed_shape,
+            embeddings_dir=embeddings_tmp_folder,
+            num_series=num_series,
             max_rows_per_file=max_rows_per_embedding_file,
         )
 
         # Create index.
         logger.info("Building index...")
 
-        self.index = index_embeddings(
-            embeddings_folder=EMBEDDING_TMP_SUBFOLDER,
-            index_folder=index_folder,
-            save_index_to_disk=save_index_to_disk,
+        faiss_index = index_embeddings(
+            embeddings_folder=embeddings_tmp_folder,
             **index_kwargs,
         )
 
-        # Get memory map of embeddings directly.
-        self.embeddings = np.memmap(
-            embeddings_path, shape=embed_shape, dtype=np.float32, mode="r"
+        shutil.rmtree(embeddings_tmp_folder)
+
+        # Create configuration dictionary.
+        config_dict = dict(memmap_dir=_memmap_dir)
+
+        sig = signature(cls.build)
+        _locals = locals()
+
+        for param in sig.parameters.values():
+            if param.name in _locals:
+                config_dict[param.name] = _locals[param.name]
+
+        # Instantiate object.
+        return cls(
+            faiss_index=faiss_index,
+            chunks_idx_memmap=get_chunks_idx,
+            data_memmap=get_data,
+            tokens_memmap=get_tokens,
+            config_dict=config_dict,
         )
+
+    def save(
+        self,
+        directory: Union[str, Path],
+    ) -> None:
+
+        """
+        Save Docstore built from files.
+
+        Args:
+            directory: Directory in which to save memory maps,
+                index, and configuration dictionary.
+        Returns:
+            None
+        """
+        logging.info("Saving index, memory maps, and Docstore config...")
+
+        # Get/create relevant paths.
+        if not Path(directory).exists():
+            Path.mkdir(directory, parents=True)
+
+        if "memmap_dir" not in self._config_dict:
+            raise ValueError("Can't save docstore loaded from disk")
+        else:
+            memmap_dir = self._config_dict["memmap_dir"]
+
+        # Move memory maps from temporary folder to destination_dir.
+        for memmap in ["data", "metadata", "tokens", "chunks_idx"]:
+            shutil.move(
+                self.memmap_path(memmap_dir, memmap),
+                self.memmap_path(directory, memmap),
+            )
+
+        # Save index.
+        index_path = self.index_path(directory)
+        faiss.write_index(self._faiss_index, str(index_path))
+
+        # Save object configuration.
+        config_path = self.config_path(directory)
+
+        with open(config_path, "w") as f:
+            json.dump(self._config_dict, f, default=str)
+
+        shutil.rmtree(memmap_dir)
+
+    # Search / filter methods.
 
     def search_index(
         self,
-        query: Sequence,
-        knns: int,
+        query_embedding: np.ndarray,
+        n_neighbors: int,
+        return_tokens: bool = False,
+        return_embedding: bool = False,
     ):
-        raise NotImplementedError
+        distances, idx = self._faiss_index.search(query_embedding, k=n_neighbors)
 
-    def load_from_file(self):
-        raise NotImplementedError
+        with (
+            self._chunks_idx_memmap(mode="r") as chunks_idx,
+            self._data_memmap(mode="r") as data,
+            self._tokens_memmap(mode="r") as tokens,
+        ):
+            print(np.where(chunks_idx == idx, data))
 
-    def save_index(self):
-        raise NotImplementedError
+    # Static utility methods.
 
-    def convert_to_torch(self):
-        raise NotImplementedError
+    @staticmethod
+    def memmap_dtype(memmap_name: str) -> np.dtype:
+        """Return datatype of relevant memory map."""
 
-    def convert_to_jnp(self):
-        raise NotImplementedError
+        if memmap_name == "data":
+            return np.float32
+        if memmap_name == "chunks_idx":
+            return np.int64
+        if memmap_name == "embeddings":
+            return np.float32
+        if memmap_name == "metadata":
+            return np.object_
+        if memmap_name == "tokens":
+            return np.int32
+        else:
+            raise ValueError(
+                f"memmap name: `{memmap_name}` must be one of:"
+                " data, chunks_idx, embeddings, metadata, tokens."
+            )
+
+    @staticmethod
+    def memmap_path(memmap_dir: Union[Path, str], memmap_name: str) -> Path:
+        """
+        Return canoncial file path of relevant memory map.
+
+        Args:
+            memmap_dir: Directory containing memory maps.
+            memmap_name: Name of memory map.
+        Returns:
+            Path of memory map.
+        """
+
+        if memmap_name not in [
+            "data",
+            "chunks_idx",
+            "embeddings",
+            "metadata",
+            "tokens",
+        ]:
+            raise ValueError(
+                f"Name of memory map: `{memmap_name}` must be one of:"
+                " data, chunks_idx, embeddings, metadata, tokens."
+            )
+
+        return Path(memmap_dir, memmap_name).with_suffix(".dat")
+
+    @staticmethod
+    def index_path(docstore_dir: Union[str, Path]) -> str:
+        """Return path of faiss index, as a string."""
+        return str(Path(docstore_dir) / "index")
+
+    @staticmethod
+    def config_path(docstore_dir: Union[str, Path]) -> Path:
+        """Return path of configuration dictionary."""
+        return Path(docstore_dir, "config").with_suffix(".json")
 
 
-# Main functions.
+# Docstore.build() helper methods.
 
 
 def memory_map_folder_contents(
@@ -247,7 +451,8 @@ def memory_map_folder_contents(
         tokens_memmap_fn: Partially constructed context manager for
             tokens memmap.
         chunks_idx_memmap_fn: Partially constructed context manager
-            for memmap that maps series to their chunks' indices.
+            for memmap that maps series to their indices in the data
+            memmap.
         doc_encoder_model: Name of huggingface pretrained transformer.
         columns_to_embed: List of the column indices of fields to
             embed.
@@ -264,25 +469,25 @@ def memory_map_folder_contents(
     # Memory map the metadata and data.
     with (
         metadata_memmap_fn(mode="w+") as metadata,
-        data_memmap_fn(mode="w+") as values,
+        data_memmap_fn(mode="w+") as data,
         chunks_idx_memmap_fn(mode="w+") as chunks_idx,
     ):
         for path in paths:
             meta = pd.read_csv(os.path.join(path, "metadata.csv"))
-            data = pd.read_csv(os.path.join(path, "data.csv")).to_numpy()
+            vals = pd.read_csv(os.path.join(path, "data.csv")).to_numpy()
 
-            # Memory map the metadata fields.
-            metadata[total_series] = meta.iloc[0]
+            # Memory map the required metadata fields.
+            metadata[total_series] = meta.iloc[[0], columns_to_embed]
 
             # Memory map data and its indices.
-            data_len = data.shape[0]
+            data_len = vals.shape[0]
             chunk_slice = slice(total_series, (total_series + data_len))
-            values[chunk_slice] = data
+            data[chunk_slice] = vals
             chunks_idx[chunk_slice] = np.full((data_len,), total_series)
 
             total_series += 1
 
-    # Batch tokenize and memory map fields to be embedded.
+    # Batch tokenize and memory map metadata.
     with (
         tokens_memmap_fn(mode="w+") as tokens,
         metadata_memmap_fn(mode="r") as metadata,
@@ -290,7 +495,7 @@ def memory_map_folder_contents(
         for row_slice in range_chunked(total_series, batch_size=batch_size):
 
             # Tokenize.
-            text_batch = metadata[row_slice, columns_to_embed]
+            text_batch = metadata[row_slice]
             text_batch = [" ".join(col) for col in text_batch]
             ids = tokenize(
                 text_batch, model=doc_encoder_model, max_length=max_metadata_seq_len
@@ -355,8 +560,8 @@ def embed_metadata(
 def chunk_embeddings_to_tmp_files(
     embeddings_memmap_fn: functools.partial,
     *,
-    folder: str,
-    shape: Tuple[int, int],
+    embeddings_dir: Union[Path, str],
+    num_series: int,
     max_rows_per_file: int,
 ) -> None:
 
@@ -367,31 +572,26 @@ def chunk_embeddings_to_tmp_files(
     Args:
         embeddings_memmap_fn: Partially constructed context manager for
             embeddings memmap.
-        folder: Path to folder where .npy files will be placed.
-        shape: The shape of the embedding memmap.
+        embeddings_dir: Directory where .npy files will be placed.
+        num_series: The total number of sequences to embed.
         max_rows_per_file: Number of rows from memmap to put .npy file.
     Returns:
         None.
     """
 
-    rows, _ = shape
-
     with embeddings_memmap_fn(mode="r") as f:
-        root_path = TMP_PATH / folder
-        reset_folder_(root_path)
+
+        reset_folder_(embeddings_dir)
 
         for ind, dim_slice in enumerate(
-            range_chunked(rows, batch_size=max_rows_per_file)
+            range_chunked(num_series, batch_size=max_rows_per_file)
         ):
-            filename = root_path / f"{ind}.npy"
+            filename = embeddings_dir / f"{ind}.npy"
             np.save(str(filename), f[dim_slice])
 
 
 def index_embeddings(
-    embeddings_folder: str,
-    save_index_to_disk: bool,
-    index_file="knn.index",
-    index_infos_file="index_infos.json",
+    embeddings_folder: Union[str, Path],
     max_index_memory_usage="100m",
     current_memory_available="1G",
     **index_kwargs,
@@ -402,8 +602,6 @@ def index_embeddings(
 
     Args:
         embeddings_folder: Temporary folder with .npy files.
-        save_index_to_disk: Whether to persist index after knn calculations.
-        index_file: File to save index to.
         index_infos_file: File to save index info to.
         max_index_memory_usage: Maximum amount of memory index can use.
         current_memory_available: Current memory available.
@@ -411,24 +609,13 @@ def index_embeddings(
         Faiss index.
     """
 
-    embeddings_path = TMP_PATH / embeddings_folder
-
-    index_path = INDEX_FOLDER_PATH / index_file
-
-    if save_index_to_disk == True:
-        reset_folder_(INDEX_FOLDER_PATH)
-
-    index = build_index(
-        embeddings=str(embeddings_path),
-        index_path=str(index_path),
-        index_infos_path=str(INDEX_FOLDER_PATH / index_infos_file),
-        save_on_disk=save_index_to_disk,
+    index, _ = build_index(
+        embeddings=str(embeddings_folder),
+        save_on_disk=False,
         max_index_memory_usage=max_index_memory_usage,
         current_memory_available=current_memory_available,
         should_be_memory_mappable=True,
         use_gpu=torch.cuda.is_available(),
     )
-
-    rmtree(embeddings_path)
 
     return index
