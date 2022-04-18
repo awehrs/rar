@@ -13,15 +13,19 @@ ROOT_DIR = Path("data")
 MOCK_DIR = ROOT_DIR / "mock"
 REAL_DIR = ROOT_DIR / "processed"
 
-# Randomly select NUM_SERIES folders in REAL_DIR.
+# Randomly select NUM_SERIES from REAL_DIR.
 
-series_folders = [Path(f.path) for f in os.scandir(REAL_DIR) if f.is_dir()]
-
-selected_folders = random.sample(series_folders, NUM_SERIES)
+series_paths = [Path(entry) for entry in os.scandir(REAL_DIR)]
+selected_series = random.sample(series_paths, NUM_SERIES)
 
 # Copy them to MOCK_DIR.
 
-for f in selected_folders:
+if MOCK_DIR.is_dir():
+    shutil.rmtree(MOCK_DIR)
+os.mkdir(MOCK_DIR)
+
+for f in selected_series:
+    f = Path(f)
     src = f
-    dst = MOCK_DIR / f.stem
-    shutil.copytree(src, dst)
+    dst = MOCK_DIR / f.name
+    shutil.copyfile(src, dst)
