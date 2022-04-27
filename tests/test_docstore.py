@@ -1,10 +1,12 @@
 from src.docstore import Docstore
-from src.utils import embed, tokenize
 
 from pathlib import Path
 import pytest
+import random
 import shutil
 import tempfile
+
+import numpy as np
 
 
 @pytest.fixture
@@ -13,8 +15,8 @@ def mockstore():
         "model": "bert-base-uncased",
         "build_dir": Path("data", "mock"),
         "load_dir": Path("tests", "test_artifacts", "test_docstore"),
-        "queries": [],
         "n_neighbors": 5,
+        "metadata_fields": ["Description", "Units"],
     }
 
 
@@ -33,20 +35,48 @@ def test_docstore_load_from_disk(mockstore):
     assert True
 
 
-def test_docstore_query_by_embeddings(mockstore):
-    """Search batch of queries."""
-    docstore = Docstore.load[mockstore["load_dir"]]
-    token_ids = tokenize(mockstore["queries"], mockstore["model"])
-    embedded_queries = embed(mockstore["model"], token_ids)
-    idx = docstore.search()
-    assert True
+def test_docstore_search(mockstore):
+    """Ensure the top search result of a docstore element is itself."""
+    docstore = Docstore.load(mockstore["load_dir"])
+    n_neighbors = mockstore["n_neighbors"]
+    query_idx = random.choices(
+        list(range(len(docstore._huggingface_dataset))), k=n_neighbors
+    )
+    queries = docstore._huggingface_dataset[query_idx]["Embeddings"]
+    queries = np.array(queries).astype(np.float32)
+    _, result_idx = docstore.search(queries, n_neighbors)
+    assert np.array_equal(np.array(query_idx), result_idx[:, 0])
 
 
-# docstore = Docstore.build(Path("data", "mock"), max_series=10000)
-# docstore.save(Path("tests", "test_artifacts", "test_docstore"))
-docstore = Docstore.load(Path("tests", "test_artifacts", "test_docstore"))
-queries = ["blah blah blah", "blah, blah, blah"]
-ids = tokenize(queries, model="bert-base-uncased", max_length=100)
-queries = embed("bert-base-uncased", ids).numpy()
+def test_docstore_get_nearest_examples(mockstore):
+    """Ensure only desired metadata fields are returned for nearest examples."""
+    docstore = Docstore.load(mockstore["load_dir"])
+    n_neighbors = mockstore["n_neighbors"]
+    metadata_fields = mockstore["metadata_fields"]
+    query_idx = random.choices(
+        list(range(len(docstore._huggingface_dataset))), k=n_neighbors
+    )
+    queries = docstore._huggingface_dataset[query_idx]["Embeddings"]
+    queries = np.array(queries).astype(np.float32)
+    _, examples = docstore.get_nearest_examples(queries, n_neighbors, metadata_fields)
+    keys = [e.keys() for e in examples]
+    assert (keys.count(keys[0]) == len(keys)) and (list(keys[0]) == metadata_fields)
 
-docstore.search_index(queries, 10)
+
+docstore = Docstore.build(Path("data", "mock"))
+docstore.save(Path("tests", "test_artifacts", "test_docstore"))
+# docstore = Docstore.load(Path("tests", "test_artifacts", "test_docstore"))
+# query_idx = random.choices(list(range(len(docstore._huggingface_dataset))), k=5)
+# queries = docstore._huggingface_dataset[query_idx]["Embeddings"]
+# import numpy as np
+
+# queries = np.array(queries).astype(np.float32)
+
+
+# d, i = docstore.get_nearest_examples(
+#     queries, n_neighbors=5, metadata_fields=["Description", "Units"]
+# )
+
+# import pandas as pd
+
+# print(i[0])

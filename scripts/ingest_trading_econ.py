@@ -1,17 +1,16 @@
 """Script to bulk download and process Trading Economics data."""
 
+import datetime
 import dotenv
 import nasdaqdatalink
 import os
 import pandas as pd
 from pathlib import Path
 import shutil
+import tempfile
 from tqdm import tqdm
 import zipfile
 
-import tempfile
-
-from pyparsing import col
 
 pd.options.mode.chained_assignment = None
 
@@ -64,9 +63,12 @@ for df in tqdm(code_dfs):
     series_code = df.iat[0, 0]
     series_path = Path(PROCESSED_DIR, series_code.replace("/", "")).with_suffix(".csv")
 
-    # Create dataframe with dates and values.
+    ## Create dataframe with dates and values. ##
+
+    # Change date formatting and transpose.
     data = df[["Date", "Values"]]
     data["Date"] = pd.to_datetime(data["Date"], format="%Y-%m-%d")
+    data["Date"] = data["Date"].dt.strftime("%Y-%m-%d")
     start_date = data["Date"].tolist()[0]
     end_date = data["Date"].tolist()[-1]
     data = data.set_index("Date").transpose().reset_index()

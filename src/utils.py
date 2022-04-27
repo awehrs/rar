@@ -36,15 +36,13 @@ def get_model(model: str) -> Callable:
 def tokenize(
     texts: Union[List, Tuple],
     *,
-    model: str,
+    tokenizer: Callable,
     max_length: int,
     add_special_tokens: bool = True,
 ) -> torch.tensor:
 
     if not isinstance(texts, (list, tuple)):
         texts = [texts]
-
-    tokenizer = get_tokenizer(model)
 
     encoding = tokenizer.batch_encode_plus(
         texts,
@@ -62,20 +60,21 @@ def tokenize(
 
 @torch.no_grad()
 def embed(
-    model: str,
     token_ids,
+    encoder: Callable,
     return_cls_repr: bool = False,
     eps: float = 1e-8,
     pad_id: int = 0,
 ):
 
-    model = get_model(model)
     mask = token_ids != pad_id
 
     if torch.cuda.is_available():
         token_ids = token_ids.cuda()
 
-    outputs = model(input_ids=token_ids, attention_mask=mask, output_hidden_states=True)
+    outputs = encoder(
+        input_ids=token_ids, attention_mask=mask, output_hidden_states=True
+    )
 
     hidden_state = outputs.hidden_states[-1]
 
