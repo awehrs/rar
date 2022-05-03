@@ -1,4 +1,4 @@
-from src.utils import embed, get_model, get_tokenizer, reset_folder_, tokenize
+from src.utils import embed, get_model, get_tokenizer, tokenize
 
 from inspect import signature
 import json
@@ -78,7 +78,6 @@ class Docstore:
         Returns:
             Docstore instance.
         """
-
         # Check that relevant files exist.
         root_dir = Path(docstore_dir)
 
@@ -86,13 +85,11 @@ class Docstore:
             index_path=cls.index_path(root_dir),
             config_path=cls.config_path(root_dir),
         )
-
         for _path in _paths.values():
             if not os.path.isfile(_path):
                 raise ValueError(
                     f"The file {_path} files does not exist in indicated directory."
                 )
-
         # Load object configuration.
         _config_dict: dict = {}
 
@@ -158,7 +155,7 @@ class Docstore:
 
         tokenizer = get_tokenizer(doc_encoder_model)
 
-        encoder = get_model(doc_encoder_model)g
+        encoder = get_model(doc_encoder_model)
 
         hf_dataset = hf_dataset.map(
             tokenize_and_embed,
@@ -259,6 +256,12 @@ class Docstore:
         """
         Return the scores and indices of the nearest examples to a
             given batch of queries.
+
+        Args:
+            query_embeddings: array of shape (batch_size, num_queries, embedding_dim)
+            n_neighbors: the number of results to fetch per query in batch.
+        Returns:
+            ()
         """
 
         scores, indices = self._faiss_index.search(query_embeddings, n_neighbors)
@@ -270,8 +273,12 @@ class Docstore:
         query_embedding: np.array,
         n_neighbors: int,
         metadata_fields: Optional[List[str]] = None,
-    ) -> Tuple:
-
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Return the rows in the huggingface_dataset (filter by
+            requested columns) of the nearest examples for a batch
+            of search queries.
+        """
         total_scores, total_indices = self.search(query_embedding, n_neighbors)
         total_scores = [
             scores_i[: len([i for i in indices_i if i >= 0])]
@@ -364,7 +371,6 @@ def chunk_embeddings_to_tmp_files(
     Returns:
         None.
     """
-
     data = np.vstack(example_batch["Embeddings"])
     file_num = indicies[0] % batch_size
     filename = Path(embeddings_dir) / f"{file_num}.npy"
@@ -392,7 +398,6 @@ def index_embeddings(
     Returns:
         Faiss index.
     """
-
     index, index_info = build_index(
         embeddings=str(embeddings_folder),
         save_on_disk=False,
@@ -401,5 +406,4 @@ def index_embeddings(
         should_be_memory_mappable=True,
         use_gpu=torch.cuda.is_available(),
     )
-
     return index, index_info

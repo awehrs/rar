@@ -61,22 +61,3 @@ def test_docstore_get_nearest_examples(mockstore):
     _, examples = docstore.get_nearest_examples(queries, n_neighbors, metadata_fields)
     keys = [e.keys() for e in examples]
     assert (keys.count(keys[0]) == len(keys)) and (list(keys[0]) == metadata_fields)
-
-
-docstore = Docstore.build(Path("data", "mock"))
-docstore.save(Path("tests", "test_artifacts", "test_docstore"))
-# docstore = Docstore.load(Path("tests", "test_artifacts", "test_docstore"))
-# query_idx = random.choices(list(range(len(docstore._huggingface_dataset))), k=5)
-# queries = docstore._huggingface_dataset[query_idx]["Embeddings"]
-# import numpy as np
-
-# queries = np.array(queries).astype(np.float32)
-
-
-# d, i = docstore.get_nearest_examples(
-#     queries, n_neighbors=5, metadata_fields=["Description", "Units"]
-# )
-
-# import pandas as pd
-
-# print(i[0])
