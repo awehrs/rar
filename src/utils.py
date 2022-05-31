@@ -1,6 +1,4 @@
 import os
-from shutil import rmtree
-from pathlib import Path
 from typing import Callable, List, Tuple, Union
 
 from einops import rearrange
@@ -99,5 +97,3 @@ def embed(
 
 def is_true_env_flag(env_flag):
     return os.getenv(env_flag, "false").lower() in ("true", "1", "t")
-
-

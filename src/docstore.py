@@ -1,3 +1,4 @@
+from concurrent.futures import thread
 from src.utils import embed, get_model, get_tokenizer, tokenize
 
 from inspect import signature
@@ -7,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Tuple, Union
 
 from autofaiss import build_index
 import datasets
@@ -62,6 +63,21 @@ class Docstore:
         self._huggingface_dataset = huggingface_dataset
         self._config_dict = config_dict
 
+    def __getitem__(self, indices: Union[int, list]):
+        """Slice huggingface datset by index."""
+        return self._huggingface_dataset[indices]
+
+    @property
+    def num_metadata_fields(self) -> int:
+        """Get the number of metadata columns in dataset."""
+        return self._config_dict["num_metadata_fields"]
+
+    @property
+    def time_index(self) -> List[str]:
+        """Get the common time index for series' values."""
+        # Exclude last two columns ("Tokens", "Embeddings").
+        return self._huggingface_dataset.column_names[self.num_metadata_fields : -2]
+
     # Factory functions.
 
     @classmethod
@@ -110,6 +126,7 @@ class Docstore:
         data_dir: Union[str, Path],
         doc_encoder_model: str = "bert-base-uncased",
         fields_to_embed: List[str] = ["Description", "Units"],
+        num_metadata_fields: int = 6,
         max_metadata_seq_len: int = 100,
         max_rows_per_embedding_file: int = 500,
         metadata_to_embedding_batch_size: int = 16,
@@ -124,6 +141,8 @@ class Docstore:
             doc_encoder_model: Model name of document encoder.
             fields_to_embed: The metadata fields to concatenate, embed,
                 and index.
+            num_metadata_fields: The number of columns of metadata in
+                data files.
             max_metadata_seq_len: Maximum number of tokens in metadata
                 sequence to be embedded.
             max_rows_per_embedding_file: Maximum number of embeddings per
@@ -252,34 +271,104 @@ class Docstore:
         self,
         query_embeddings: np.array,
         n_neighbors: int,
-    ) -> Tuple:
+    ) -> Tuple[List[List[float]], List[List[int]]]:
         """
         Return the scores and indices of the nearest examples to a
             given batch of queries.
 
         Args:
-            query_embeddings: array of shape (batch_size, num_queries, embedding_dim)
+            query_embeddings: Array of shape [batch_size, num_queries, embedding_dim].
             n_neighbors: the number of results to fetch per query in batch.
         Returns:
-            ()
+            scores: The retrieval scores of the retrieved examples per query.
+            indices: The indices of the retrieved examples per query.
         """
+        if len(query_embeddings.shape) != 2:
+            raise ValueError("Shape of query must be 2D")
+
+        if not query_embeddings.flags.c_contiguous:
+            query_embeddings = np.asarray(query_embeddings, order="C")
 
         scores, indices = self._faiss_index.search(query_embeddings, n_neighbors)
 
         return scores, indices.astype(int)
 
+    def transform_data(
+        self,
+        data_dfs: List,
+        search_date: str,
+        num_samples: int,
+        resample_freq: str,
+        aggregation_fn: str,
+        dropna_coverage_ratio: int,
+    ):
+        # Concat dataframes to single dataframe.
+        batch_size = len(data_dfs)
+        df = pd.concat(data_dfs)
+
+        # Convert columns to datetime.
+        df.columns = pd.to_datetime(df.columns, format="%Y-%m-%d")
+
+        # Resample.
+        df = df.resample(rule=resample_freq, axis=1).agg(aggregation_fn).ffill(axis=1)
+
+        # Slice by date.
+        df = df.loc[:, :search_date]
+        df = df.iloc[:, len(df.columns) - num_samples :]
+
+        # Split dataframe back into batches.
+        dropna_threshold = int(len(df.columns) * (dropna_coverage_ratio / 100))
+
+        transformed_dfs = [
+            _df.dropna(axis=0, thresh=dropna_threshold)
+            for _df in np.split(df, batch_size, axis=0)
+        ]
+
+        # Normalize.
+
+        raise NotImplementedError
+
+    def filter_by_date(self):
+        raise NotImplementedError
+
+    def fill_na(self):
+        raise NotImplementedError
+
+    def normalize(self):
+        raise NotImplementedError
+
     def get_nearest_examples(
         self,
         query_embedding: np.array,
         n_neighbors: int,
-        metadata_fields: Optional[List[str]] = None,
-    ) -> Tuple[List[Dict], List[Dict]]:
+        search_date,
+        num_samples: int,
+        frequency: str = "M",
+        aggregation_fn: str = "mean",
+        dropna_coverage_ratio: int = 80,
+        metadata_field: str = "Embeddings",
+    ) -> Tuple[List[List[float]], List[dict]]:
         """
-        Return the rows in the huggingface_dataset (filter by
+        Return the rows in the huggingface_dataset (filtered by
             requested columns) of the nearest examples for a batch
             of search queries.
+
+        Returns:
+            total_scores: The retrieval scores of the retrieved examples per query.
+            total_examples: The retrieved examples per query.
+
         """
+        if metadata_field not in ["Embeddings", "Tokens"]:
+            raise ValueError  # TODO specify ValueError
+
+        if aggregation_fn not in ["min", "max", "mean", "last"]:
+            raise ValueError  # TODO specify ValueError
+
+        if not 0 < dropna_coverage_ratio <= 100:
+            raise ValueError  # TODO specify ValueError
+
         total_scores, total_indices = self.search(query_embedding, n_neighbors)
+
         total_scores = [
             scores_i[: len([i for i in indices_i if i >= 0])]
             for scores_i, indices_i in zip(total_scores, total_indices)
@@ -288,12 +377,19 @@ class Docstore:
             self._huggingface_dataset[[i for i in indices if i >= 0]]
             for indices in total_indices
         ]
-        if metadata_fields is not None:
-            total_samples = (
-                pd.DataFrame(total_samples)[metadata_fields]
-                .applymap(lambda cell: cell[0])
-                .to_dict("records")
-            )
+
+        # Break up retrieved samples into data and metadata.
+        sample_dfs = [pd.DataFrame(sample) for sample in total_samples]
+
+        data = [df[self.time_index] for df in sample_dfs]
+
+        metadata = [df[metadata_field] for df in sample_dfs]
+
+        # Filter / fill / sample data.
+        # transformed_data = self.transform_data(
+        #     data, search_date, start_date, num_samples, na_fill_type
+        # )
+
         return total_scores, total_samples
 
     # Static utility methods.
