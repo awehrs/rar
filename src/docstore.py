@@ -1,4 +1,4 @@
-from concurrent.futures import thread
+from einops import rearrange
 from src.utils import embed, get_model, get_tokenizer, tokenize
 
 from inspect import signature
@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Callable, Dict, List, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Tuple, Union
 
 from autofaiss import build_index
 import datasets
@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 from pyarrow import dataset
 import torch
+import torch.nn.functional as F
 
 
 # Logging.
@@ -66,6 +67,8 @@ class Docstore:
     def __getitem__(self, indices: Union[int, list]):
         """Slice huggingface datset by index."""
         return self._huggingface_dataset[indices]
+
+    # Properties.
 
     @property
     def num_metadata_fields(self) -> int:
@@ -293,15 +296,29 @@ class Docstore:
 
         return scores, indices.astype(int)
 
-    def transform_data(
+    def resample_data(
         self,
-        data_dfs: List,
+        data_dfs: List[pd.DataFrame],
         search_date: str,
         num_samples: int,
         resample_freq: str,
-        aggregation_fn: str,
-        dropna_coverage_ratio: int,
-    ):
+        aggregation_fn: Union[str, Callable],
+    ) -> List[pd.DataFrame]:
+        """
+        Function to resample a batch of KNN results.
+
+        Args:
+            data_dfs: List of dataframes of length [batch_size]. Each frame
+                contains K nearest neighbors of query.
+            search_date: Date beyond which values are masked out.
+            num_samples: The number of data points to return.
+            resample_freq: String describing resampling rule, as defined in
+                https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases
+            aggregation_fn: numpy function (np.sum, np.mean, etc.) or string name of pandas
+                function ("min", "sum", etc.) used to aggregate resampled/binned dataframe.
+        Returns:
+            List of dataframes of length [batch_size].
+        """
         # Concat dataframes to single dataframe.
         batch_size = len(data_dfs)
         df = pd.concat(data_dfs)
@@ -310,42 +327,20 @@ class Docstore:
         df.columns = pd.to_datetime(df.columns, format="%Y-%m-%d")
 
         # Resample.
-        df = df.resample(rule=resample_freq, axis=1).agg(aggregation_fn).ffill(axis=1)
+        df = df.resample(rule=resample_freq, axis=1).agg(aggregation_fn)
 
         # Slice by date.
         df = df.loc[:, :search_date]
         df = df.iloc[:, len(df.columns) - num_samples :]
 
-        # Split dataframe back into batches.
-        dropna_threshold = int(len(df.columns) * (dropna_coverage_ratio / 100))
+        transformed_dfs = [_df for _df in np.split(df, batch_size, axis=0)]
 
-        transformed_dfs = [
-            _df.dropna(axis=0, thresh=dropna_threshold)
-            for _df in np.split(df, batch_size, axis=0)
-        ]
-
-        # Normalize.
-
-        raise NotImplementedError
-
-    def filter_by_date(self):
-        raise NotImplementedError
-
-    def fill_na(self):
-        raise NotImplementedError
-
-    def normalize(self):
-        raise NotImplementedError
+        return transformed_dfs
 
     def get_nearest_examples(
         self,
         query_embedding: np.array,
         n_neighbors: int,
-        search_date,
-        num_samples: int,
-        frequency: str = "M",
-        aggregation_fn: str = "mean",
-        dropna_coverage_ratio: int = 80,
         metadata_field: str = "Embeddings",
     ) -> Tuple[List[List[float]], List[dict]]:
         """
@@ -353,19 +348,21 @@ class Docstore:
             requested columns) of the nearest examples for a batch
             of search queries.
 
+        Args:
+            query_embedding: Array of queries. Length of array = batch_size.
+            n_neighbors: Number of results to return per query.
+            metadata_field: The metadata field in the huggingface dataset to return (e.g.,
+                "Tokens" or "Metadata")
         Returns:
             total_scores: The retrieval scores of the retrieved examples per query.
             total_examples: The retrieved examples per query.
 
         """
         if metadata_field not in ["Embeddings", "Tokens"]:
-            raise ValueError  # TODO specify ValueError
-
-        if aggregation_fn not in ["min", "max", "mean", "last"]:
-            raise ValueError  # TODO specify ValueError
-
-        if not 0 < dropna_coverage_ratio <= 100:
-            raise ValueError  # TODO specify ValueError
+            raise ValueError(
+                f'metadata_field {metadata_field} must be one of "Embeddings" or'
+                '"Tokens".'
+            )
 
         total_scores, total_indices = self.search(query_embedding, n_neighbors)
 
@@ -378,19 +375,103 @@ class Docstore:
             for indices in total_indices
         ]
 
-        # Break up retrieved samples into data and metadata.
-        sample_dfs = [pd.DataFrame(sample) for sample in total_samples]
+        return total_scores, total_samples
+
+    def date_aligned_knn(
+        self,
+        query_embedding: np.array,
+        n_neighbors: int,
+        search_date: str,
+        num_samples: int,
+        resample_freq: str = "M",
+        aggregation_fn: Union[str, Callable] = "mean",
+        dropna_threshold: int = 100,
+        metadata_field: str = "Embeddings",
+    ) -> Mapping[str, torch.tensor]:
+        """
+        Wrapper for the following processing pipeline:
+            (1) Retrieve KNN for a batch of queries,
+            (2) Resample KNN,
+            (3) Handle NAs,
+            (4) Restructure data for date-aligned preprocessor consumption.
+
+        Args:
+            query_embedding: Array of queries. Length of array = batch_size.
+            n_neighbors: Number of results to return per query.
+            search_date: Date beyond which query result values are masked out.
+            num_samples: The number of data points to return.
+            resample_freq: String describing resampling rule, as defined in
+                https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases
+            aggregation_fn: numpy function (np.sum, np.mean, etc.) or string name of pandas
+                function ("min", "sum", etc.) used to aggregate resampled/binned dataframe.
+            dropna_threshold: Minimum number of valid observations per series.
+            metadata_field: The metadata field in the huggingface dataset to return (e.g.,
+                "Tokens" or "Metadata")
+        Returns:
+
+        """
+        # Retrieve KNNs.
+        _, batch_knn = self.get_nearest_examples(query_embedding, n_neighbors)
+
+        sample_dfs = [pd.DataFrame(knn) for knn in batch_knn]
 
         data = [df[self.time_index] for df in sample_dfs]
 
         metadata = [df[metadata_field] for df in sample_dfs]
 
-        # Filter / fill / sample data.
-        # transformed_data = self.transform_data(
-        #     data, search_date, start_date, num_samples, na_fill_type
-        # )
+        # Resample.
+        data = self.resample_data(
+            data,
+            search_date,
+            num_samples,
+            resample_freq,
+            aggregation_fn,
+        )
 
-        return total_scores, total_samples
+        # Handle NAs:
+        #   Forward fill.
+        #   Drop series with too few observations.
+        #   Back fill remaining series.
+        data = [df.ffill(axis=1) for df in data]
+
+        for i in range(len(data)):
+            null_by_row = data[i].isnull().sum(axis=1)
+            null_row_idx = []
+            for j in range(len(null_by_row)):
+                if (len(data[i].columns) - null_by_row[j]) < dropna_threshold:
+                    null_row_idx.append(j)
+            data[i].drop(index=null_row_idx, inplace=True)
+            metadata[i].drop(index=null_row_idx, inplace=True)
+
+        data = [df.bfill(axis=1) for df in data]
+
+        # Restructure data.
+        data_tensors = []
+        meta_tensors = []
+        for (d, m) in zip(data, metadata):
+            data_batch = torch.stack(
+                [torch.FloatTensor(series) for series in d.values], dim=1
+            )
+            meta_batch = torch.stack(
+                [torch.FloatTensor(series) for series in m.values], dim=1
+            )
+            # Pad each batch if rows were dropped due to too many NAs.
+            if data_batch.shape[1] < n_neighbors:
+                data_batch = F.pad(data_batch, (0, n_neighbors - data_batch.shape[1]))
+                meta_batch = F.pad(meta_batch, (0, n_neighbors - meta_batch.shape[1]))
+            data_tensors.append(data_batch)
+            meta_tensors.append(meta_batch)
+
+        data = torch.stack(data_tensors, dim=1)
+        metadata = torch.stack(meta_tensors, dim=1)
+
+        data = rearrange(data, "s b k -> b k s")
+        metadata = rearrange(metadata, "d b k -> b k d")
+
+        return {"data": data, "metadata": metadata}
+
+    def pure_sequence_knn(self):
+        raise NotImplementedError
 
     # Static utility methods.
 

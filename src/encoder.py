@@ -10,15 +10,16 @@ import transformers.models.perceiver.modeling_perceiver as perceiver
 class PerceiverForTimeSeriesAutoencoding:
     pass
 
-
 class PerceiverForTimeSeriesPrediction:
     pass
 
+class RawSequencePreprocessor(perceiver.AbstractPreprocessor):
+    pass
 
-class TimeSeriesPreprocessor(perceiver.AbstractPreprocessor):
+class DateAlignedPreprocessor(perceiver.AbstractPreprocessor):
     """
     A multimodal preprocessor for text (sentence embeddings) and
-     time series (patches of samples).
+     time series (date-aligned patches of samples).
     """
 
     def __init__(
@@ -214,9 +215,6 @@ class DataPreprocessor(perceiver.AbstractPreprocessor):
 
         # Optionally project them to a target dimension.
         pos_enc = self._positions_projection(pos_enc)
-
-        # Optionally normalize each series.
-        # TODO
 
         # Reshape inputs and positional encodings to allow add/concat.
         inputs = rearrange(
