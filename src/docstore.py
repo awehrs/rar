@@ -1,4 +1,3 @@
-from einops import rearrange
 from src.utils import embed, get_model, get_tokenizer, tokenize
 
 from inspect import signature
@@ -12,6 +11,7 @@ from typing import Callable, Dict, List, Mapping, Tuple, Union
 
 from autofaiss import build_index
 import datasets
+from einops import rearrange
 import faiss
 import numpy as np
 import pandas as pd
@@ -299,17 +299,21 @@ class Docstore:
     def resample_data(
         self,
         data_dfs: List[pd.DataFrame],
+        meta_dfs: List[pd.DataFrame],
         search_date: str,
         num_samples: int,
         resample_freq: str,
         aggregation_fn: Union[str, Callable],
+        coverage_ratio: float,
     ) -> List[pd.DataFrame]:
         """
         Function to resample a batch of KNN results.
 
         Args:
             data_dfs: List of dataframes of length [batch_size]. Each frame
-                contains K nearest neighbors of query.
+                contains data for K nearest neighbors of query.
+            meta_dfs: List of dataframes of length [batch_size]. Each frame
+                contains metadata for K nearest neighbors of query.
             search_date: Date beyond which values are masked out.
             num_samples: The number of data points to return.
             resample_freq: String describing resampling rule, as defined in
@@ -326,16 +330,50 @@ class Docstore:
         # Convert columns to datetime.
         df.columns = pd.to_datetime(df.columns, format="%Y-%m-%d")
 
-        # Resample.
-        df = df.resample(rule=resample_freq, axis=1).agg(aggregation_fn)
+        # Create datetime index that matches parameters.
+        date_index = pd.date_range(
+            end=search_date, freq=resample_freq, periods=num_samples
+        )
+        start_date = date_index[0]
+        end_date = date_index[-1]
 
-        # Slice by date.
-        df = df.loc[:, :search_date]
-        df = df.iloc[:, len(df.columns) - num_samples :]
+        # Truncate unused dates.
+        df = df.truncate(before=start_date, after=end_date, axis=1)
 
-        transformed_dfs = [_df for _df in np.split(df, batch_size, axis=0)]
+        # Calculate window for which each series has observations.
+        dates_df = pd.concat(
+            [
+                df.apply(pd.Series.first_valid_index, axis=1),
+                df.apply(pd.Series.last_valid_index, axis=1),
+            ],
+            axis=1,
+        )
+        dates_df["difference"] = dates_df[1] - dates_df[0]
+        dates_df["coverage"] = dates_df["difference"] / (end_date - start_date)
+        dates_df["keep"] = dates_df["coverage"] >= coverage_ratio
 
-        return transformed_dfs
+        # Resample, reindex, and fill.
+        df = (
+            df.resample(rule=resample_freq, axis=1)
+            .agg(aggregation_fn)
+            .reindex(date_index, axis=1)
+            .ffill(axis=1)
+            .bfill(axis=1)
+        )
+
+        # Drop series with too small an observation window.
+        values = [_df for _df in np.split(df, batch_size, axis=0)]
+
+        filters = [_df for _df in np.split(dates_df, batch_size, axis=0)]
+
+        transformed_data_dfs = [
+            value[filter_["keep"] == True] for (value, filter_) in zip(values, filters)
+        ]
+        transformed_meta_dfs = [
+            meta[filter_["keep"] == True] for (meta, filter_) in zip(meta_dfs, filters)
+        ]
+
+        return transformed_data_dfs, transformed_meta_dfs
 
     def get_nearest_examples(
         self,
@@ -385,7 +423,7 @@ class Docstore:
         num_samples: int,
         resample_freq: str = "M",
         aggregation_fn: Union[str, Callable] = "mean",
-        dropna_threshold: int = 100,
+        coverage_ratio: float = 0.7,
         metadata_field: str = "Embeddings",
     ) -> Mapping[str, torch.tensor]:
         """
@@ -404,11 +442,12 @@ class Docstore:
                 https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases
             aggregation_fn: numpy function (np.sum, np.mean, etc.) or string name of pandas
                 function ("min", "sum", etc.) used to aggregate resampled/binned dataframe.
-            dropna_threshold: Minimum number of valid observations per series.
+            coverage_ratio: Float between 0 and 1. Indicates minimum percentage of the
+                results window each series must span in order to be used.
             metadata_field: The metadata field in the huggingface dataset to return (e.g.,
                 "Tokens" or "Metadata")
         Returns:
-
+            TODO
         """
         # Retrieve KNNs.
         _, batch_knn = self.get_nearest_examples(query_embedding, n_neighbors)
@@ -420,30 +459,15 @@ class Docstore:
         metadata = [df[metadata_field] for df in sample_dfs]
 
         # Resample.
-        data = self.resample_data(
+        data, metadata = self.resample_data(
             data,
+            metadata,
             search_date,
             num_samples,
             resample_freq,
             aggregation_fn,
+            coverage_ratio,
         )
-
-        # Handle NAs:
-        #   Forward fill.
-        #   Drop series with too few observations.
-        #   Back fill remaining series.
-        data = [df.ffill(axis=1) for df in data]
-
-        for i in range(len(data)):
-            null_by_row = data[i].isnull().sum(axis=1)
-            null_row_idx = []
-            for j in range(len(null_by_row)):
-                if (len(data[i].columns) - null_by_row[j]) < dropna_threshold:
-                    null_row_idx.append(j)
-            data[i].drop(index=null_row_idx, inplace=True)
-            metadata[i].drop(index=null_row_idx, inplace=True)
-
-        data = [df.bfill(axis=1) for df in data]
 
         # Restructure data.
         data_tensors = []

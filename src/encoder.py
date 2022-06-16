@@ -10,11 +10,14 @@ import transformers.models.perceiver.modeling_perceiver as perceiver
 class PerceiverForTimeSeriesAutoencoding:
     pass
 
+
 class PerceiverForTimeSeriesPrediction:
     pass
 
+
 class RawSequencePreprocessor(perceiver.AbstractPreprocessor):
     pass
+
 
 class DateAlignedPreprocessor(perceiver.AbstractPreprocessor):
     """
