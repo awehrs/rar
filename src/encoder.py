@@ -22,7 +22,7 @@ class RawSequencePreprocessor(perceiver.AbstractPreprocessor):
 class DateAlignedPreprocessor(perceiver.AbstractPreprocessor):
     """
     A multimodal preprocessor for text (sentence embeddings) and
-     time series (date-aligned patches of samples).
+        time series (date-aligned patches of samples).
     """
 
     def __init__(
